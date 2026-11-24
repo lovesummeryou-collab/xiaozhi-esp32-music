@@ -318,6 +318,18 @@ void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
     auto state = GetDeviceState();
 
+    // 网络就绪后探测音乐服务连通性（后台任务，不阻塞主循环）
+    auto music = Board::GetInstance().GetMusic();
+    if (music) {
+        xTaskCreate(
+            [](void* arg) {
+                auto* m = static_cast<Music*>(arg);
+                m->CheckConnection();
+                vTaskDelete(NULL);
+            },
+            "music_ping", 4096, music, 1, nullptr);
+    }
+
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
         // Network is ready, start activation
         SetDeviceState(kDeviceStateActivating);
@@ -764,6 +776,24 @@ void Application::InitializeProtocol() {
 }
 
 void Application::ShowActivationCode(const std::string& code, const std::string& message) {
+    // 把激活码通过音乐服务的 /device/ping 上报，便于服务端日志查看
+    auto music = Board::GetInstance().GetMusic();
+    if (music && !code.empty()) {
+        struct CodeReportArgs {
+            Music* music;
+            std::string code;
+        };
+        auto* args = new CodeReportArgs{music, code};
+        xTaskCreate(
+            [](void* arg) {
+                auto* a = static_cast<CodeReportArgs*>(arg);
+                a->music->ReportActivationCode(a->code);
+                delete a;
+                vTaskDelete(NULL);
+            },
+            "code_report", 4096, args, 1, nullptr);
+    }
+
     struct digit_sound {
         char digit;
         const std::string_view& sound;

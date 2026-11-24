@@ -10,8 +10,10 @@
 #include <esp_heap_caps.h>
 #include <esp_pthread.h>
 #include <esp_timer.h>
+#include <nvs.h>
 #include <cJSON.h>
 #include <cstring>
+#include <cstdio>
 #include <chrono>
 #include <sstream>
 #include <algorithm>
@@ -22,9 +24,60 @@
 
 #define TAG "Esp32Music"
 
-// ========== 音乐服务鉴权 ==========
-// 与服务端 MUSIC_ESP32_SECRET 保持一致；留空则不发送 Authorization 头。
-#define MUSIC_AUTH_TOKEN "your-esp32-secret-key-2024"
+// ========== 音乐服务配置（配网页面写入 NVS "wifi" 命名空间）==========
+// 默认值与编译期保持一致；配网页面一旦保存则优先使用 NVS 中的值。
+#define MUSIC_DEFAULT_BASE_URL "http://192.168.68.111:2233"
+#define MUSIC_DEFAULT_AUTH_TOKEN "esp32-secret"
+
+// 从 NVS 读取字符串，未配置时返回默认值
+static std::string ReadMusicConfig(const char* key, const char* default_value, size_t max_len)
+{
+    nvs_handle_t nvs;
+    if (nvs_open("wifi", NVS_READONLY, &nvs) != ESP_OK)
+    {
+        return default_value;
+    }
+    std::vector<char> buffer(max_len + 1, 0);
+    size_t length = buffer.size();
+    esp_err_t err = nvs_get_str(nvs, key, buffer.data(), &length);
+    nvs_close(nvs);
+    if (err != ESP_OK || length == 0)
+    {
+        return default_value;
+    }
+    return std::string(buffer.data());
+}
+
+static std::string GetMusicBaseUrl()
+{
+    static std::string cached;
+    static bool loaded = false;
+    if (!loaded)
+    {
+        cached = ReadMusicConfig("music_base_url", MUSIC_DEFAULT_BASE_URL, 255);
+        // 去掉尾部斜杠，避免拼接出双斜杠
+        while (!cached.empty() && cached.back() == '/')
+        {
+            cached.pop_back();
+        }
+        loaded = true;
+        ESP_LOGI(TAG, "Music base URL: %s", cached.c_str());
+    }
+    return cached;
+}
+
+static std::string GetMusicAuthToken()
+{
+    static std::string cached;
+    static bool loaded = false;
+    if (!loaded)
+    {
+        cached = ReadMusicConfig("music_auth", MUSIC_DEFAULT_AUTH_TOKEN, 128);
+        loaded = true;
+        ESP_LOGI(TAG, "Music auth token loaded (%u bytes)", (unsigned)cached.size());
+    }
+    return cached;
+}
 
 /**
  * @brief 为HTTP请求添加鉴权头
@@ -32,9 +85,10 @@
  */
 static void add_auth_headers(Http *http)
 {
-    if (http && MUSIC_AUTH_TOKEN[0] != '\0')
+    auto token = GetMusicAuthToken();
+    if (http && !token.empty())
     {
-        http->SetHeader("Authorization", std::string("Bearer ") + MUSIC_AUTH_TOKEN);
+        http->SetHeader("Authorization", std::string("Bearer ") + token);
     }
 }
 
@@ -68,50 +122,6 @@ static std::string url_encode(const std::string &str)
     return encoded;
 }
 
-// 在文件开头添加一个辅助函数，统一处理URL构建
-static std::string buildUrlWithParams(const std::string &base_url, const std::string &path, const std::string &query)
-{
-    std::string result_url = base_url + path + "?";
-    size_t pos = 0;
-    size_t amp_pos = 0;
-
-    while ((amp_pos = query.find("&", pos)) != std::string::npos)
-    {
-        std::string param = query.substr(pos, amp_pos - pos);
-        size_t eq_pos = param.find("=");
-
-        if (eq_pos != std::string::npos)
-        {
-            std::string key = param.substr(0, eq_pos);
-            std::string value = param.substr(eq_pos + 1);
-            result_url += key + "=" + url_encode(value) + "&";
-        }
-        else
-        {
-            result_url += param + "&";
-        }
-
-        pos = amp_pos + 1;
-    }
-
-    // 处理最后一个参数
-    std::string last_param = query.substr(pos);
-    size_t eq_pos = last_param.find("=");
-
-    if (eq_pos != std::string::npos)
-    {
-        std::string key = last_param.substr(0, eq_pos);
-        std::string value = last_param.substr(eq_pos + 1);
-        result_url += key + "=" + url_encode(value);
-    }
-    else
-    {
-        result_url += last_param;
-    }
-
-    return result_url;
-}
-
 Esp32Music::Esp32Music() : last_downloaded_data_(), current_music_url_(), current_song_name_(),
                            song_name_displayed_(false), current_lyric_url_(), lyrics_(),
                            current_lyric_index_(-1), lyric_thread_(), is_lyric_running_(false),
@@ -122,6 +132,69 @@ Esp32Music::Esp32Music() : last_downloaded_data_(), current_music_url_(), curren
 {
     ESP_LOGI(TAG, "Music player initialized with default spectrum display mode");
     InitializeMp3Decoder();
+}
+
+// 向音乐服务发送探活请求；code 非空时通过 X-Activation-Code 头一并上报
+static void PingMusicService(const std::string& code)
+{
+    auto base_url = GetMusicBaseUrl();
+    if (base_url.empty())
+    {
+        return;
+    }
+
+    auto network = Board::GetInstance().GetNetwork();
+    if (!network)
+    {
+        ESP_LOGW(TAG, "Music check skipped: network not available");
+        return;
+    }
+
+    auto http = network->CreateHttp(0);
+    if (!http)
+    {
+        ESP_LOGW(TAG, "Music check skipped: failed to create HTTP client");
+        return;
+    }
+
+    http->SetHeader("User-Agent", "ESP32-Music-Player/1.0");
+    http->SetHeader("X-Device-MAC", SystemInfo::GetMacAddress());
+    if (!code.empty())
+    {
+        http->SetHeader("X-Activation-Code", code);
+    }
+    add_auth_headers(http.get());
+
+    std::string url = base_url + "/device/ping";
+    auto opened = http->Open("GET", url);
+    if (!opened)
+    {
+        ESP_LOGW(TAG, "Music service check failed: %s", opened.error().ToString().c_str());
+        return;
+    }
+
+    auto status = http->GetStatusCode();
+    http->ReadAll();
+    http->Close();
+
+    if (status && *status == 200)
+    {
+        ESP_LOGI(TAG, "Music service connected: %s", base_url.c_str());
+    }
+    else
+    {
+        ESP_LOGW(TAG, "Music service check returned status %d", status ? *status : -1);
+    }
+}
+
+void Esp32Music::CheckConnection()
+{
+    PingMusicService("");
+}
+
+void Esp32Music::ReportActivationCode(const std::string& code)
+{
+    PingMusicService(code);
 }
 
 Esp32Music::~Esp32Music()
@@ -264,8 +337,8 @@ bool Esp32Music::Download(const std::string &song_name, const std::string &artis
     // 保存歌名用于后续显示
     current_song_name_ = song_name;
 
-    // 第一步：请求stream_pcm接口获取音频信息
-    std::string base_url = "http://110.42.59.54:2233";
+    // 第一步：请求stream_pcm接口获取音频信息（地址来自配网配置/NVS）
+    std::string base_url = GetMusicBaseUrl();
     std::string full_url = base_url + "/stream_pcm?song=" + url_encode(song_name) + "&artist=" + url_encode(artist_name);
 
     ESP_LOGI(TAG, "Request URL: %s", full_url.c_str());
@@ -1473,20 +1546,18 @@ bool Esp32Music::ParseLyrics(const std::string &lyric_content)
                         continue;
                     }
 
-                    // 是时间格式，解析时间戳
-                    try
+                    // 是时间格式，解析时间戳（不用异常，IDF 默认 -fno-exceptions）
+                    int minutes = 0;
+                    float seconds = 0.0f;
+                    if (sscanf(tag_or_time.c_str(), "%d:%f", &minutes, &seconds) == 2)
                     {
-                        int minutes = std::stoi(tag_or_time.substr(0, colon_pos));
-                        float seconds = std::stof(tag_or_time.substr(colon_pos + 1));
                         int timestamp_ms = minutes * 60 * 1000 + (int)(seconds * 1000);
 
                         // 安全处理歌词文本，确保UTF-8编码正确
                         std::string safe_lyric_text;
                         if (!content.empty())
                         {
-                            // 创建安全副本并验证字符串
                             safe_lyric_text = content;
-                            // 确保字符串以null结尾
                             safe_lyric_text.shrink_to_fit();
                         }
 
@@ -1494,7 +1565,6 @@ bool Esp32Music::ParseLyrics(const std::string &lyric_content)
 
                         if (!safe_lyric_text.empty())
                         {
-                            // 限制日志输出长度，避免中文字符截断问题
                             size_t log_len = std::min(safe_lyric_text.length(), size_t(50));
                             std::string log_text = safe_lyric_text.substr(0, log_len);
                             ESP_LOGD(TAG, "Parsed lyric: [%d ms] %s", timestamp_ms, log_text.c_str());
@@ -1504,7 +1574,7 @@ bool Esp32Music::ParseLyrics(const std::string &lyric_content)
                             ESP_LOGD(TAG, "Parsed lyric: [%d ms] (empty)", timestamp_ms);
                         }
                     }
-                    catch (const std::exception &e)
+                    else
                     {
                         ESP_LOGW(TAG, "Failed to parse time: %s", tag_or_time.c_str());
                     }

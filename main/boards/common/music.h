@@ -16,6 +16,10 @@ public:
     virtual size_t GetBufferSize() const = 0;
     virtual bool IsDownloading() const = 0;
     virtual int16_t* GetAudioData() = 0;
+    // 网络就绪后主动向音乐服务探活（默认空实现，由具体播放器覆盖）
+    virtual void CheckConnection() {}
+    // 获取到激活验证码后上报给音乐服务
+    virtual void ReportActivationCode(const std::string& code) {}
 };
 
 #endif // MUSIC_H 
